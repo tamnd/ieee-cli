@@ -2,79 +2,80 @@ package ieee
 
 import (
 	"context"
-	"net/url"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes ieee as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/ieee-cli/ieee"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// ieee:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone ieee binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// init registers the IEEE domain so ant can load it with a blank import.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the ieee driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the IEEE driver. No state; the per-run client is built by the factory.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme and identity for this domain.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "ieee",
-		Hosts:  []string{Host},
+		Hosts:  []string{IEEEHost, CrossRefHost},
 		Identity: kit.Identity{
 			Binary: "ieee",
 			Short:  "Search IEEE Xplore papers from the command line",
-			Long: `Search IEEE Xplore papers from the command line
+			Long: `Search IEEE Xplore papers from the command line.
 
-ieee reads public ieee data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+ieee fetches paper metadata from the CrossRef public API (api.crossref.org),
+filtered to IEEE publications (DOI prefix 10.1109). CrossRef is the
+policy-compliant, open alternative to ieeexplore.ieee.org, which blocks
+non-browser clients via CloudFront WAF.
+
+No API key is required. Full text requires an institutional subscription;
+this CLI retrieves metadata only.
+
+Quick start:
+  ieee search "deep learning" -n 10
+  ieee search "transformer" --year-start 2017 --type conference
+  ieee paper 10.1109/cvpr.2016.90
+  ieee top --subject machine-learning -n 20
+  ieee search "neural network" -o json | jq '.[].doi'`,
+			Site: IEEEHost,
 			Repo: "https://github.com/tamnd/ieee-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and all operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `ieee page` and
-	// `ant get ieee://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "papers",
+		Summary: "Search IEEE papers via CrossRef",
+		Args:    []kit.Arg{{Name: "query", Help: "search terms (e.g. \"deep learning\")"}},
+	}, searchPapers)
 
-	// List op: members of a page, the home of `ieee links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// ieee://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:     "paper",
+		Group:    "papers",
+		Summary:  "Fetch a single paper by DOI or IEEE Xplore URL",
+		Single:   true,
+		URIType:  "paper",
+		Resolver: true,
+		Args:     []kit.Arg{{Name: "ref", Help: "DOI (e.g. 10.1109/cvpr.2016.90) or Xplore URL"}},
+	}, getPaper)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "top",
+		Group:   "papers",
+		Summary: "List top IEEE papers by citation count",
+	}, topPapers)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds a Client from the resolved kit Config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
-	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
-	}
+	c := DefaultConfig()
 	if cfg.Rate > 0 {
 		c.Rate = cfg.Rate
 	}
@@ -82,45 +83,63 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	if cfg.UserAgent != "" {
+		c.UserAgent = cfg.UserAgent
+	}
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query     string  `kit:"arg" help:"search terms"`
+	YearStart int     `kit:"flag" help:"earliest publication year" default:"0"`
+	YearEnd   int     `kit:"flag" help:"latest publication year" default:"0"`
+	DocType   string  `kit:"flag" help:"document type: journal, conference, standard" default:""`
+	Limit     int     `kit:"flag,inherit" help:"max results" default:"20"`
+	Client    *Client `kit:"inject"`
+}
+
+type paperInput struct {
+	Ref    string  `kit:"arg" help:"DOI or IEEE Xplore URL"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type topInput struct {
+	Subject string  `kit:"flag" help:"subject area (e.g. machine-learning, computer-vision)" default:""`
+	Limit   int     `kit:"flag,inherit" help:"max results" default:"20"`
+	Client  *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func searchPapers(ctx context.Context, in searchInput, emit func(Paper) error) error {
+	if in.Query == "" {
+		return errs.Usage("query is required (e.g. ieee search \"deep learning\")")
 	}
-	return emit(p)
-}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+	papers, err := in.Client.SearchPapers(ctx, in.Query, SearchOptions{
+		YearStart: in.YearStart,
+		YearEnd:   in.YearEnd,
+		DocType:   in.DocType,
+		Limit:     limit,
+	})
 	if err != nil {
-		return mapErr(err)
+		return fmt.Errorf("search: %w", err)
 	}
-	for _, p := range pages {
+	if len(papers) == 0 {
+		return errs.NotFound("no results for %q", in.Query)
+	}
+	for _, p := range papers {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +147,95 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full ieee.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized ieee reference: %q", input)
+func getPaper(ctx context.Context, in paperInput, emit func(*Paper) error) error {
+	ref := strings.TrimSpace(in.Ref)
+	if ref == "" {
+		return errs.Usage("ref is required (e.g. ieee paper 10.1109/cvpr.2016.90)")
 	}
-	return "page", id, nil
+
+	// If it's an Xplore URL, extract article ID for a DOI search via CrossRef
+	doi := ref
+	if IsIEEEXploreURL(ref) {
+		id := ExtractXploreID(ref)
+		if id == "" {
+			return errs.Usage("could not extract article ID from URL: %s", ref)
+		}
+		// Try to find the DOI via CrossRef search
+		doi = IEEEDoiPrefix + "/" + id
+	}
+
+	p, err := in.Client.GetPaper(ctx, doi)
+	if err != nil {
+		return err
+	}
+	return emit(p)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+func topPapers(ctx context.Context, in topInput, emit func(Paper) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	papers, err := in.Client.TopPapers(ctx, in.Subject, limit)
+	if err != nil {
+		return fmt.Errorf("top papers: %w", err)
+	}
+	if len(papers) == 0 {
+		return errs.NotFound("no papers found")
+	}
+	for _, p := range papers {
+		if err := emit(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver ---
+
+// Classify turns any accepted input into (uriType, id).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("ieee: empty input")
+	}
+
+	// Full Xplore URL
+	if IsIEEEXploreURL(input) {
+		xid := ExtractXploreID(input)
+		if xid != "" {
+			return "paper", xid, nil
+		}
+	}
+
+	// DOI: starts with 10.1109/
+	if strings.HasPrefix(input, "10.1109/") || strings.HasPrefix(input, "https://doi.org/10.1109/") {
+		doi := normalizeDOI(input)
+		return "paper", doi, nil
+	}
+
+	// doi.org URL for any DOI
+	if strings.Contains(input, "doi.org/") {
+		doi := normalizeDOI(input)
+		return "paper", doi, nil
+	}
+
+	return "", "", errs.Usage("ieee: unrecognized reference %q (expected DOI or Xplore URL)", input)
+}
+
+// Locate returns the canonical URL for a (uriType, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "paper":
+		if strings.HasPrefix(id, "10.") {
+			return "https://doi.org/" + id, nil
+		}
+		return fmt.Sprintf("https://%s/document/%s", IEEEHost, id), nil
+	default:
 		return "", errs.Usage("ieee has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
